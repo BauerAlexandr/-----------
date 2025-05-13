@@ -7,13 +7,16 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import (
     QAction, QIcon, QKeySequence, QPalette, 
     QColor, QDropEvent, QDragEnterEvent, QPainter,
-    QActionGroup, QFont,
+    QActionGroup, QFont, QTextCursor,
 )
 from PyQt6.QtCore import Qt, QTranslator, QRect
 from ui_interf import Ui_MainWindow
 from simple_text_edit import CodeEditor
 from scanner import JSScanner
+from parser import JSParser
 import re
+from expression_parser_with_quads import ExpressionParser
+from regex_search_dialog import RegexSearchDialog
 
 
 class LineNumberTextEdit(QPlainTextEdit):
@@ -143,6 +146,11 @@ class ResultTabWidget(QTabWidget):
         token_tab.setLayout(layout)
         
         self.addTab(token_tab, "Результаты анализа")
+        
+        # Добавляем обработчик клика по таблице ошибок
+        error_table = self.widget(1).findChild(QTableWidget)
+        if error_table:
+            error_table.cellDoubleClicked.connect(self.navigate_to_error)
     
     def setup_error_table(self):
         """Настройка таблицы ошибок"""
@@ -244,6 +252,47 @@ class ResultTabWidget(QTabWidget):
     def switch_to_errors_tab(self):
         """Переключение на вкладку с ошибками"""
         self.setCurrentIndex(1)
+
+    def navigate_to_error(self, row, column):
+        """Перемещает курсор к ошибке при двойном клике по строке в таблице ошибок"""
+        # Находим родительское окно
+        parent = self.parent()
+        while parent and not isinstance(parent, TextEditor):
+            parent = parent.parent()
+        
+        if not parent:
+            return
+        
+        # Получаем информацию об ошибке
+        table = self.widget(1).findChild(QTableWidget)
+        if not table:
+            return
+        
+        # Получаем строку и позицию ошибки
+        try:
+            line_item = table.item(row, 0)
+            position_item = table.item(row, 1)
+            
+            if line_item and position_item:
+                line = int(line_item.text())
+                position = int(position_item.text())
+                
+                # Перемещаем курсор к позиции ошибки
+                editor = parent.get_current_editor()
+                if editor:
+                    # Получаем текстовый документ и создаем курсор
+                    doc = editor.document()
+                    cursor = QTextCursor(doc)
+                    
+                    # Перемещаемся к указанной строке
+                    block = doc.findBlockByLineNumber(line - 1)  # Нумерация строк начинается с 0
+                    if block.isValid():
+                        cursor.setPosition(block.position() + position - 1)
+                        editor.setTextCursor(cursor)
+                        editor.centerCursor()  # Центрируем вид на курсоре
+                        editor.setFocus()  # Устанавливаем фокус на редактор
+        except (ValueError, TypeError) as e:
+            print(f"Ошибка при навигации к ошибке: {e}")
 
 
 class TranslationHelper:
@@ -364,6 +413,18 @@ class TextEditor(QMainWindow):
         
         # Регистрация редактора для Drag & Drop
         self.setAcceptDrops(True)
+        
+        # Добавляем действие для поиска по регулярным выражениям
+        self.action_RegexSearch = QAction(parent=self)
+        self.action_RegexSearch.setObjectName("action_RegexSearch")
+        self.action_RegexSearch.setText("Поиск по регулярным выражениям")
+        self.action_RegexSearch.setShortcut("Ctrl+Shift+F")
+        self.ui.menuEdit.addAction(self.action_RegexSearch)
+        self.action_RegexSearch.triggered.connect(self.show_regex_search)
+        
+        # Создаем диалог поиска
+        self.regex_search_dialog = RegexSearchDialog(self)
+        self.regex_search_dialog.highlight_match.connect(self.highlight_match)
     
     def remove_old_result_area(self):
         """Удаляем старую область результатов"""
@@ -516,7 +577,7 @@ class TextEditor(QMainWindow):
         # Обновляем заголовок вкладки, добавляя звездочку, если её еще нет
         title = self.ui.tabWidget.tabText(index)
         if not title.startswith('*'):
-            self.ui.tabWidget.setTabText(index, f"*{title}")
+                self.ui.tabWidget.setTabText(index, f"*{title}")
             
         # Обновляем строку состояния
         self.status_message_label.setText("Несохраненные изменения")
@@ -550,9 +611,14 @@ class TextEditor(QMainWindow):
             )
             
             if reply == QMessageBox.StandardButton.Save:
-                return self.save_file()
+                # Если пользователь хочет сохранить и сохранение не удалось, отменяем закрытие
+                if not self.save_file():
+                    event.ignore()
+                    return
             elif reply == QMessageBox.StandardButton.Cancel:
-                return False
+                # Если пользователь отменил, отменяем закрытие
+                event.ignore()
+                return
         return True
 
     # Методы редактирования текста
@@ -680,7 +746,7 @@ class TextEditor(QMainWindow):
         help_text = ("""
          ## Основные функции
 
-    
+
     ### Основные команды
 
     - **Создать новый документ**: `Ctrl+N` или через меню "Файл" -> "Создать".
@@ -749,6 +815,7 @@ class TextEditor(QMainWindow):
         text = current_editor.toPlainText()
         if not text:
             self.add_console_message("Нет текста для анализа")
+            self.status_message_label.setText("Нет текста для анализа")
             return
         
         # Инициализируем сканер и выполняем токенизацию
@@ -783,14 +850,23 @@ class TextEditor(QMainWindow):
         if hasattr(current_editor, "set_errors"):
             current_editor.set_errors(errors)
         
-        # Добавляем информацию в консоль
+        # Добавляем информацию в консоль и статусную строку
         if len(errors) == 0:
-            self.add_console_message("Лексический анализ завершен успешно. Ошибок не найдено.")
+            success_message = "Лексический анализ завершен успешно. Ошибок не найдено."
+            self.add_console_message(success_message)
+            self.status_message_label.setText(success_message)
             # Переключаемся на вкладку с результатами
             self.result_tabs.switch_to_results_tab()
         else:
             error_message = f"Лексический анализ завершен с ошибками. Найдено ошибок: {len(errors)}"
             self.add_console_message(error_message)
+            self.status_message_label.setText(error_message)
+            
+            # Показываем первую ошибку в статусной строке для быстрого доступа
+            if errors:
+                first_error = errors[0]
+                detailed_message = f"Первая ошибка: строка {first_error['line']}, позиция {first_error['position']} - {first_error['message']}"
+                self.add_console_message(detailed_message)
             
             # Добавляем ошибки в таблицу ошибок
             for error in errors:
@@ -812,13 +888,297 @@ class TextEditor(QMainWindow):
         
         return valid_tokens, errors
 
+    def run_syntax_analysis(self):
+        """Выполняет только синтаксический анализ (без лексического)"""
+        # Получаем текущий редактор
+        editor = self.get_current_editor()
+        if not editor:
+            QMessageBox.warning(self, "Ошибка", "Нет открытого файла")
+            return
+            
+        # Получаем текст из редактора
+        text = editor.toPlainText()
+        
+        # Очищаем предыдущие ошибки
+        if hasattr(editor, "set_errors"):
+            editor.set_errors([])
+        
+        # Сбрасываем предыдущие результаты
+        self.result_tabs.clear_token_table()
+        self.result_tabs.clear_error_table()
+        
+        # Создаем парсер
+        parser = JSParser()
+        
+        # Выполняем анализ
+        tokens, syntax_errors = parser.parse(text)
+        
+        # Добавляем информацию в консоль
+        self.add_console_message("Запуск синтаксического анализа")
+        
+        # Заполняем таблицу токенов в главном окне
+        valid_tokens = [token for token in tokens if token.type != "ERROR"]
+        if valid_tokens:
+            for token in valid_tokens:
+                self.result_tabs.add_token_to_table(
+                    token.line, token.column, token.type, token.value
+                )
+        
+        # Преобразуем ошибки в формат для подсветки
+        errors = []
+        for error in syntax_errors:
+            error_info = {
+                'line': error.line,
+                'position': error.column,
+                'value': error.value if error.value else "",
+                'message': error.message
+            }
+            errors.append(error_info)
+            
+            # Добавляем ошибку в таблицу ошибок
+            self.result_tabs.add_error_to_table(
+                error.line, error.column, error.value if error.value else "", error.message
+            )
+            
+        # Отображаем журнал восстановления после ошибок
+        recovery_logs = parser.get_recovery_logs()
+        if recovery_logs:
+            self.add_console_message("=== Журнал восстановления после ошибок (метод Айронса) ===")
+            for log in recovery_logs:
+                self.add_console_message(log)
+            self.add_console_message("=== Конец журнала восстановления ===")
+        
+        # Устанавливаем ошибки для подсветки в редакторе
+        if hasattr(editor, "set_errors"):
+            editor.set_errors(errors)
+        
+        # Добавляем информацию в статусную строку
+        if len(errors) == 0:
+            success_message = "Синтаксический анализ завершен успешно. Ошибок не найдено."
+            self.add_console_message(success_message)
+            self.status_message_label.setText(success_message)
+            # Переключаемся на вкладку с результатами
+            self.result_tabs.switch_to_results_tab()
+        else:
+            error_message = f"Синтаксический анализ завершен с ошибками. Найдено ошибок: {len(errors)}"
+            self.add_console_message(error_message)
+            self.status_message_label.setText(error_message)
+            
+            # Показываем первую ошибку в статусной строке для быстрого доступа
+            if errors:
+                first_error = errors[0]
+                detailed_message = f"Первая ошибка: строка {first_error['line']}, позиция {first_error['position']} - {first_error['message']}"
+                self.add_console_message(detailed_message)
+            
+            # Переключаемся на вкладку с ошибками
+            self.result_tabs.switch_to_errors_tab()
+
+    def run_full_analysis(self):
+        """Выполняет полный анализ (лексический и синтаксический)"""
+        # Получаем текущий редактор
+        current_editor = self.get_current_editor()
+        if not current_editor:
+            QMessageBox.warning(self, "Ошибка", "Нет открытого файла")
+            return
+            
+        # Получаем текст из редактора
+        text = current_editor.toPlainText()
+        
+        # Очищаем предыдущие ошибки
+        if hasattr(current_editor, "set_errors"):
+            current_editor.set_errors([])
+        
+        # Сбрасываем предыдущие результаты
+        self.result_tabs.clear_token_table()
+        self.result_tabs.clear_error_table()
+        
+        # Добавляем информацию в консоль
+        self.add_console_message("Запуск полного анализа (лексический и синтаксический)")
+        
+        # Создаем окно для результатов лексического анализа, если его еще нет
+        if not hasattr(self, 'lexer_results_window'):
+            self.lexer_results_window = QMainWindow(self)
+            self.lexer_results_window.setWindowTitle("Результаты лексического анализа")
+            self.lexer_results_window.resize(800, 400)
+            
+            # Создаем виджет с вкладками для лексического анализа
+            self.lexer_tabs = ResultTabWidget(self.lexer_results_window)
+            self.lexer_tabs.setup_error_table()
+            self.lexer_results_window.setCentralWidget(self.lexer_tabs)
+        else:
+            # Очищаем результаты предыдущего анализа
+            self.lexer_tabs.clear_token_table()
+            self.lexer_tabs.clear_error_table()
+        
+        # Шаг 1: Лексический анализ
+        scanner = JSScanner()
+        tokens = scanner.tokenize(text)
+        
+        # Заполняем таблицу токенов в окне лексического анализа
+        for token in tokens:
+            self.lexer_tabs.add_token_to_table(
+                token.line, token.column, token.type, token.value
+            )
+        
+        # Показываем окно с результатами лексического анализа
+        self.lexer_results_window.show()
+        
+        # Шаг 2: Синтаксический анализ
+        parser = JSParser()
+        tokens, syntax_errors = parser.parse(text)
+        
+        # Заполняем таблицу токенов в главном окне
+        valid_tokens = [token for token in tokens if token.type != "ERROR"]
+        if valid_tokens:
+            for token in valid_tokens:
+                self.result_tabs.add_token_to_table(
+                    token.line, token.column, token.type, token.value
+                )
+        
+        # Преобразуем ошибки в формат для подсветки
+        errors = []
+        
+        # Добавляем все ошибки (лексические и синтаксические)
+        for token in tokens:
+            if token.type == "ERROR":
+                error_message = f"Лексическая ошибка: {token.value}"
+                error_info = {
+                    'line': token.line,
+                    'position': token.column,
+                    'value': token.value,
+                    'message': error_message
+                }
+                errors.append(error_info)
+                
+                # Добавляем в таблицу ошибок
+                self.result_tabs.add_error_to_table(
+                    token.line, token.column, token.value, error_message
+                )
+        
+        # Добавляем синтаксические ошибки
+        for error in syntax_errors:
+            error_info = {
+                'line': error.line,
+                'position': error.column,
+                'value': error.value if error.value else "",
+                'message': f"Синтаксическая ошибка: {error.message}"
+            }
+            errors.append(error_info)
+            
+            # Добавляем в таблицу ошибок
+            self.result_tabs.add_error_to_table(
+                error.line, error.column, error.value if error.value else "", 
+                f"Синтаксическая ошибка: {error.message}"
+            )
+        
+        # Отображаем журнал восстановления после ошибок
+        recovery_logs = parser.get_recovery_logs()
+        if recovery_logs:
+            self.add_console_message("\n=== Журнал восстановления после ошибок (метод Айронса) ===")
+            for log in recovery_logs:
+                self.add_console_message(log)
+            self.add_console_message("=== Конец журнала восстановления ===\n")
+        
+        # Устанавливаем ошибки для подсветки в редакторе
+        if hasattr(current_editor, "set_errors"):
+            current_editor.set_errors(errors)
+        
+        # Добавляем информацию в консоль и статусную строку
+        if len(errors) == 0:
+            success_message = "Полный анализ завершен успешно. Ошибок не найдено."
+            self.add_console_message(success_message)
+            self.status_message_label.setText(success_message)
+            # Переключаемся на вкладку с результатами
+            self.result_tabs.switch_to_results_tab()
+        else:
+            error_message = f"Полный анализ завершен с ошибками. Найдено ошибок: {len(errors)}"
+            self.add_console_message(error_message)
+            self.status_message_label.setText(error_message)
+            
+            # Показываем первую ошибку в статусной строке для быстрого доступа
+            if errors:
+                first_error = errors[0]
+                detailed_message = f"Первая ошибка: строка {first_error['line']}, позиция {first_error['position']} - {first_error['message']}"
+                self.add_console_message(detailed_message)
+            
+            # Переключаемся на вкладку с ошибками
+            self.result_tabs.switch_to_errors_tab()
+        
+        # Сообщение о завершении полного анализа
+        self.add_console_message("Полный анализ (лексический и синтаксический) завершен")
+
+
+    def run_expression_analysis(self):
+        current_editor = self.get_current_editor()
+        if not current_editor:
+            QMessageBox.warning(self, "Ошибка", "Нет открытого документа")
+            return
+
+        text = current_editor.toPlainText()
+
+        parser = ExpressionParser()
+        quads, errors = parser.parse(text)
+
+        self.result_tabs.clear_token_table()
+        self.result_tabs.clear_error_table()
+
+        if errors:
+            for err in errors:
+                self.result_tabs.add_console_message(err)
+                self.result_tabs.add_error_to_table(1, 1, "Выражение", err)
+            self.result_tabs.switch_to_errors_tab()
+        else:
+            # Добавим новую вкладку для тетрад, если ещё не добавлена
+            if not hasattr(self, 'quad_table'):
+                self.quad_table = QTableWidget()
+                self.quad_table.setColumnCount(4)
+                self.quad_table.setHorizontalHeaderLabels(["Операция", "Аргумент 1", "Аргумент 2", "Результат"])
+                self.result_tabs.addTab(self.quad_table, "Тетрады")
+
+            self.quad_table.setRowCount(0)
+            for quad in quads:
+                row = self.quad_table.rowCount()
+                self.quad_table.insertRow(row)
+                self.quad_table.setItem(row, 0, QTableWidgetItem(quad.op))
+                self.quad_table.setItem(row, 1, QTableWidgetItem(quad.arg1))
+                self.quad_table.setItem(row, 2, QTableWidgetItem(quad.arg2))
+                self.quad_table.setItem(row, 3, QTableWidgetItem(quad.result))
+
+            self.result_tabs.setCurrentWidget(self.quad_table)
+            self.result_tabs.add_console_message("Анализ выражения завершен успешно.")
+
+
     def setup_additional_actions(self):
         """Настройка дополнительных действий, например для запуска анализатора"""
-        # Кнопка для запуска лексического анализатора
-        analyze_button = QAction("Анализ", self)
-        analyze_button.setToolTip("Запустить лексический анализатор")
+        # Кнопка для запуска полного анализа (лексического и синтаксического)
+        analyze_button = QAction("Анализ кода", self)
+        analyze_button.setToolTip("Запустить полный анализ (лексический и синтаксический)")
         analyze_button.setIcon(QIcon(self.get_icon_path("play--v1.png")))
-        analyze_button.triggered.connect(self.run_lexical_analysis)
+        analyze_button.triggered.connect(self.run_full_analysis)
+
+        expression_button = QAction("Анализ выражения (тетрады)", self)
+        expression_button.setToolTip("Запустить анализ арифметического выражения и вывести тетрады")
+        expression_button.triggered.connect(self.run_expression_analysis)
+
+        self.ui.menuRun.addAction(expression_button)
+        self.ui.toolBar.addAction(expression_button)
+
+        
+        # Создаем кнопки для лексического и синтаксического анализа
+        lexical_button = QAction("Лексический анализ", self)
+        lexical_button.setToolTip("Запустить только лексический анализ")
+        lexical_button.setIcon(QIcon(self.get_icon_path("lex-analyze.png")))
+        lexical_button.triggered.connect(self.run_lexical_analysis)
+        
+        syntax_button = QAction("Синтаксический анализ", self)
+        syntax_button.setToolTip("Запустить только синтаксический анализ")
+        syntax_button.setIcon(QIcon(self.get_icon_path("syntax-analyze.png")))
+        syntax_button.triggered.connect(self.run_syntax_analysis)
+        
+        # Добавляем кнопки в меню Пуск
+        self.ui.menuRun.addAction(lexical_button)
+        self.ui.menuRun.addAction(syntax_button)
+        self.ui.menuRun.addAction(analyze_button)
         
         # Добавляем кнопку на панель инструментов
         self.ui.toolBar.addSeparator()
@@ -1068,7 +1428,7 @@ class TextEditor(QMainWindow):
                 
                 # Спрашиваем пользователя, хочет ли он сохранить изменения
                 reply = QMessageBox.question(
-                    self, 'Сохранение изменений',
+                    self, 'Сохранение',
                     f'В файле {self.ui.tabWidget.tabText(i).replace("*", "")} есть несохраненные изменения. Сохранить?',
                     QMessageBox.StandardButton.Save | 
                     QMessageBox.StandardButton.Discard | 
@@ -1087,6 +1447,23 @@ class TextEditor(QMainWindow):
         
         # Если все изменения были сохранены или отклонены, принимаем закрытие
         event.accept()
+
+    def show_regex_search(self):
+        """Показывает диалог поиска по регулярным выражениям"""
+        editor = self.get_current_editor()
+        if editor:
+            self.regex_search_dialog.set_text(editor.toPlainText())
+            self.regex_search_dialog.exec()
+    
+    def highlight_match(self, start: int, end: int):
+        """Выделяет найденное совпадение в тексте"""
+        editor = self.get_current_editor()
+        if editor:
+            cursor = editor.textCursor()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            editor.setTextCursor(cursor)
+            editor.setFocus()
 
 
 # Запуск приложения при прямом выполнении модуля
