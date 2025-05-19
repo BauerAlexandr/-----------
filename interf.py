@@ -17,6 +17,7 @@ from parser import JSParser
 import re
 from expression_parser_with_quads import ExpressionParser
 from regex_search_dialog import RegexSearchDialog
+from recursive_parser import RecursiveDescentParser
 
 
 class LineNumberTextEdit(QPlainTextEdit):
@@ -1148,6 +1149,35 @@ class TextEditor(QMainWindow):
             self.result_tabs.add_console_message("Анализ выражения завершен успешно.")
 
 
+    def run_recursive_analysis(self):
+        editor = self.get_current_editor()
+        if not editor:
+            QMessageBox.warning(self, "Ошибка", "Нет открытого файла")
+            return
+
+        text = editor.toPlainText()
+        parser = RecursiveDescentParser()
+        call_stack, errors, logs = parser.parse(text)
+
+        if not hasattr(self, 'recursive_tab'):
+            from PyQt6.QtWidgets import QTextEdit
+            self.recursive_tab = QTextEdit()
+            self.recursive_tab.setReadOnly(True)
+            self.result_tabs.addTab(self.recursive_tab, "Рекурсивный спуск")
+
+        output = "Лог вызова процедур:\n" + "\n".join(call_stack)
+        output += "\n\nЛог выполнения:\n" + "\n".join(logs)
+        if errors:
+            output += "\n\nОшибки:\n"
+            for err in errors:
+                output += f"{err['message']} (строка {err['line']}, позиция {err['column']})\n"
+        else:
+            output += "\n\nОшибки не обнаружены."
+
+        self.recursive_tab.setPlainText(output)
+        self.result_tabs.setCurrentWidget(self.recursive_tab)
+
+
     def setup_additional_actions(self):
         """Настройка дополнительных действий, например для запуска анализатора"""
         # Кнопка для запуска полного анализа (лексического и синтаксического)
@@ -1183,6 +1213,14 @@ class TextEditor(QMainWindow):
         # Добавляем кнопку на панель инструментов
         self.ui.toolBar.addSeparator()
         self.ui.toolBar.addAction(analyze_button)
+
+        recursive_button = QAction("Рекурсивный анализ", self)
+        recursive_button.setToolTip("Запустить анализ методом рекурсивного спуска")
+        recursive_button.triggered.connect(self.run_recursive_analysis)
+
+        self.ui.menuRun.addAction(recursive_button)
+        self.ui.toolBar.addAction(recursive_button)
+        
     
     def setup_toolbar_icons(self):
         """Настройка иконок для панели инструментов"""
